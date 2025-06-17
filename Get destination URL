@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+from urllib.parse import parse_qs, unquote, urlparse, urlunparse
+from typing import Optional
+import subprocess
+import json
+import sys
+import re
+
+# 🎀🎀 ---------- Helpers ---------- 🎀🎀
+
+def _clean_url(raw: str) -> str:
+    return raw.strip().strip('\'"')
+
+_REDIRECT_KEYS = (
+    "url", "u", "dest", "dest_url", "ds_dest_url",
+    "redirect", "redirect_url", "adurl", "to", "r", "link",
+)
+
+def _same_except_scheme(a: str, b: str) -> bool:
+    pa, pb = urlparse(a), urlparse(b)
+    return pa._replace(scheme='') == pb._replace(scheme='')
+
+# 🎀🎀 ---------- Extraction logic ---------- 🎀🎀
+
+def _extract_from_query(url: str) -> Optional[str]:
+    """ 🩰 Finds a redirect parameter in the query string itself! Fastest and avoids network round-trips. We are busy girlies and we cannot waste any time!!! 🩰 """
+    qs = parse_qs(urlparse(url).query, keep_blank_values=True)
+    for k in _REDIRECT_KEYS:
+        if k in qs and qs[k] and qs[k][0]:
+            return unquote(qs[k][0])
+
+    """ 🩰 A fallback for when the value is hidden after the fragment! 🩰 """
+    m = re.search(r'[?&](?:' + '|'.join(_REDIRECT_KEYS) + r')=([^&#]+)', url)
+    if m:
+        return unquote(m.group(1))
+    return None
+
+def _extract_with_curl(url: str, timeout: int = 8) -> Optional[str]:
+    """ 🩰 Follows HTTP redirects with curl! This impersonates a real browser so Google will return the location header. 🩰 """
+    base_cmd = [
+        "/usr/bin/curl", "-Ls",
+        "-A", "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0_0)",
+        "-e", "https://www.google.com/",
+        url,
+    ]
+    
+    """ 🩰 First tries %{redirect_url}. Falls back to the effective URL. 🩰 """
+    for fmt in ("%{redirect_url}", "%{url_effective}"):
+        res = subprocess.run(
+            base_cmd + ["-o", "/dev/null", "-w", fmt],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        final = res.stdout.strip()
+        if final and final != url:
+            return final
+    return None
+
+def resolve(url: str) -> Optional[str]:
+    """ 🩰 Main resolver. Query-param shortcut first, then network fallback. 🩰 """
+    url = _clean_url(url)
+    return _extract_from_query(url) or _extract_with_curl(url)
+
+# 🎀🎀 ---------- Alfred JSON helpers ---------- 🎀🎀
+
+def _alfred_items(resolved: Optional[str], note: Optional[str]):
+    """ 🩰 Builds Alfred's script filter JSON. 🩰 """
+    if resolved:
+        subtitle = "↩︎ copy to clipboard • ⌘↩︎ open in browser"
+        if note == "no_redirect":
+            subtitle += " • Note: There are no redirects!"
+        elif note == "https_only":
+            subtitle += " • Note: There is only an https redirect!"
+        return [{
+            "uid": resolved,
+            "title": resolved,
+            "subtitle": subtitle,
+            "arg": resolved,
+            "valid": True,
+            "text": {
+                "copy": resolved,
+                "largetype": resolved,
+            },
+            "mods": {
+                "cmd": {
+                    "valid": True,
+                    "arg": resolved,
+                    "subtitle": "⌘↩︎ open in browser",
+                }
+            }
+        }]
+    return [{
+        "title": "The URL couldn’t be resolved :(",
+        "subtitle": "The link may be malformed or blocked by your network.",
+        "valid": False,
+    }]
+
+# 🎀🎀 ---------- Main ---------- 🎀🎀
+
+def main() -> None:
+    query = " ".join(sys.argv[1:])
+    if not query:
+        print(json.dumps({"items": _alfred_items(None, None)}))
+        return
+
+    cleaned = _clean_url(query)
+    resolved = resolve(cleaned)
+
+    if not resolved or resolved == cleaned:
+        note = "no_redirect"
+        resolved = resolved or cleaned
+    elif _same_except_scheme(resolved, cleaned):
+        note = "https_only"
+    else:
+        note = None
+
+    print(json.dumps({"items": _alfred_items(resolved, note)}))
+
+if __name__ == "__main__":
+    main()
